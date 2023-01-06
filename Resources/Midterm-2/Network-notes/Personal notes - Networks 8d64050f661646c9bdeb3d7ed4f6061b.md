@@ -30,6 +30,7 @@ Then just use `sudo ./iptables1.sh reset` when making changes and testing.
 | ISAKMP | 500 | UDP |
 | NAT-T | 4500 | UDP |
 | IPSec | / | AH/ESP |
+| RADIUS | 1812-1814 | UDP |
 
 ## 1.2 Packet filters (stateless)
 
