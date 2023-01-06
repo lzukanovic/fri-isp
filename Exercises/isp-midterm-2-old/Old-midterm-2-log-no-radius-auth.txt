@@ -1,0 +1,160 @@
+# Gateway network
+We configure the gateway machine to have two NICs, one connected to the public network with NatNetwork and the other connected to Internal Network named intnet_subnet.
+
+The radius machine has one NIC connected to the same internal network as gateway.
+
+The road warrior machine has one NIC connected to the same public network as gateway.
+
+---
+
+From now on the public IPs of gateway and road warrior will be denoted as $GATEWAY and $RW.
+
+To configure correct IP addresses on gateway machine we edit the /etc/netplan/01-network-manager-all.yaml:
+```
+network:
+  version: 2
+  ethernets:
+    enp0s3:
+      dhcp4: true
+      dhcp-identifier: mac
+    enp0s8:
+      addresses: [172.16.0.1/24]
+```
+We apply the changes with: sudo netplan apply
+
+And enable packet forwarding with: echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
+
+And enable masquerading with: sudo iptables -t nat -A POSTROUTING -o enp0s3 -j MASQUERADE
+
+To configure correct IP addresses on radius machine we edit the /etc/netplan/01-network-manager-all.yaml:
+```
+network:
+  version: 2
+  ethernets:
+    enp0s3:
+      addresses: [172.16.0.2/24]
+      routes:
+        - to: default
+          via: 172.16.0.1
+      nameservers:
+        addresses: [8.8.8.8]
+```
+We apply the changes with: sudo netplan apply
+
+Now we are able to do: ping google.com
+
+# Radius
+We edit the /etc/freeradius/3.0/clients.conf file on the radius machine and add the following client:
+```
+client 172.16.0.1 {
+        secret = radiuspassword
+}
+```
+
+And add the following user to the /etc/freeradius/3.0/users file:
+```
+"alice" Cleartext-Password := "alice"
+```
+Apply changes by restarting radius server: sudo service freeradius restart
+
+# Gateway firewall
+First we disable IPv6 by appending the following to /etc/sysctl.conf:
+```
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+```
+and running: sudo sysctl -p
+
+We get the script from git repo:
+git clone https://github.com/lem-course/isp-iptables.git
+
+We edit the ~/isp-iptables/iptables2.sh file and add the following stateful filters:
+```
+# ESTABLISH-RELATED trick: Allow all packets that belong to ESTABLISHED,RELATED
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Allow outgoing DNS requests to the DNS server in variable NAMESERVER
+iptables -A OUTPUT -p udp -o $INET_IFACE -d $NAMESERVER --dport 53 -m state --state NEW -j ACCEPT
+
+# PING
+# (10) Allow outgoing icmp
+iptables -A OUTPUT -p icmp -o $INET_IFACE -m state --state NEW -j ACCEPT
+
+# (11) Allow incoming icmp
+iptables -A INPUT -p icmp -o $INET_IFACE -m state --state NEW -j ACCEPT
+
+# ISAKMP - incoming
+iptables -A INPUT -p udp --dport 500 -o $INET_IFACE -m state --state NEW -j ACCEPT
+
+# NAT-T - incoming
+iptables -A INPUT -p udp --dport 4500 -o $INET_IFACE -m state --state NEW -j ACCEPT
+
+# IPSec(ESP) - incoming
+iptables -A INPUT -p esp -o $INET_IFACE -m state --state NEW -j ACCEPT
+```
+
+...the other default values from the script can be ignored
+
+We can then enable the firewall by running: sudo ./iptables2.sh start (and reset to disable/revert)
+
+# Gateway VPN
+On gateway machine we add the following lines to /etc/ipsec.conf
+```
+conn %default
+        ikelifetime=60m
+        keylife=20m
+        rekeymargin=3m
+        keyingtries=1
+        keyexchange=ikev2
+        authby=secret
+        ike=chacha20poly1305-prfsha256-x25519!
+        esp=chacha20poly1305-x25519!
+
+conn rw
+        left=10.0.2.17  # GATEWAY IP
+        leftsubnet=172.16.0.0/24,172.16.1.0/24
+        leftid=gw                  
+        leftfirewall=yes
+        right=%any
+        rightsourceip=172.16.1.0/24
+        auto=add
+```
+
+On gateway machine we add the following lines to /etc/ipsec.secrets
+```
+: PSK "mypsk"
+```
+We restart ipsec service to apply changes: sudo ipsec restart
+
+# Road warrior
+On road warrior machine we add the following lines to /etc/ipsec.conf
+```
+conn %default
+        ikelifetime=60m
+        keylife=20m
+        rekeymargin=3m
+        keyingtries=1
+        keyexchange=ikev2
+        authby=secret
+        ike=chacha20poly1305-prfsha256-x25519!
+        esp=chacha20poly1305-x25519!
+
+conn home
+        left=10.0.2.18 # RW IP
+        leftsourceip=%config
+        leftid=alice               
+        leftfirewall=yes
+        right=10.0.2.17 # ROUTER IP
+        rightsubnet=172.16.0.0/24,172.16.1.0/24
+        rightid=gw                  
+        auto=add
+```
+On road warrior machine we add the following lines to /etc/ipsec.secrets
+```
+alice : PSK "mypsk"
+```
+We restart ipsec service to apply changes: sudo ipsec restart
+
+Now we establish the VPN connection from road warrior machine by running: sudo ipsec up home

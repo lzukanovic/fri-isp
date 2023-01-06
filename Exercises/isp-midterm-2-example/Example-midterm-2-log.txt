@@ -1,0 +1,163 @@
+# System administration assignment
+================
+Create 2 clone VMs, each acting as a router and client for a branch.
+Each clone has 2 NICs, one acting as external network, set to NatNetwork and the other an Internal network with each respecting subnet.
+
+We assume $HQ_IP is 10.0.2.6 and $BR_IP is 10.0.2.7
+
+# Virtual Private Network
+=================
+Configure the netplan for each machine.
+
+For @br
+ethernets:
+    enp0s3:
+      dhcp4: true
+      dhcp-identifier: mac
+    enp0s8:
+      addresses: [10.2.0.1/16]
+For @hq
+ethernets:
+    enp0s3:
+      dhcp4: true
+      dhcp-identifier: mac
+    enp0s8:
+      addresses: [10.1.0.1/16]
+
+and then apply changes on both machines with sudo netplan apply.
+
+## Create a VPN IPsec tunnel
+
+### Configure @hq for the following files:
+/etc/ipsec.conf:
+config setup
+
+conn %default
+        ikelifetime=60m
+        keylife=20m
+        rekeymargin=3m
+        keyingtries=1
+        keyexchange=ikev2
+        authby=secret
+
+conn net-net
+        leftsubnet=10.1.0.0/16
+        leftfirewall=yes
+        leftid=@hq
+        right=$BR_IP
+        rightsubnet=10.2.0.0/16
+        rightid=@br
+        auto=add
+
+Configure the PSK /etc/ipsec.secrets:
+@hq @br : PSK "this_is_my_psk"
+
+..then restart the IPsec service with sudo ipsec restart
+
+----
+
+### Configure @br for the following files:
+/etc/ipsec.conf:
+config setup
+
+conn %default
+        ikelifetime=60m
+        keylife=20m
+        rekeymargin=3m
+        keyingtries=1
+        keyexchange=ikev2
+        authby=secret
+
+conn net-net
+        leftsubnet=10.2.0.0/16
+        leftfirewall=yes
+        leftid=@br
+        right=$HQ_IP
+        rightsubnet=10.1.0.0/16
+        rightid=@hq
+        auto=add
+
+Configure the PSK /etc/ipsec.secrets:
+@hq @br : PSK "this_is_my_psk"
+
+..then restart the IPsec service with sudo ipsec restart
+
+----
+
+### Establish the VPN link
+We establish the VPN with running `sudo ipsec up net-net` on only one of the machines, in this case the @hq macine.
+We are now able to ping the internal netwroks of either machines (e.g.): ping -I 10.1.0.1 10.2.0.1
+
+
+# Secure Shell
+=================
+From @br we verify that we can ssh into @hq (using hq's public ip) with: ssh isp@$HQ_IP
+
+On @br we generate a new ecdsa client keypair using: ssh-keygen -t ecdsa
+And print the public key fingerprint using: ssh-keygen -lf ~/.ssh/id_ecdsa.pub
+
+We copy the ssh keys from @br to @hq using: ssh-copy-id isp@$HQ_IP
+Now we are able to ssh onto @hq without the use of password: ssh isp@$HQ_IP
+
+Next to only allow authentication with public keys we need to disable password based login with adding the following line to @hq in file /etc/ssh/sshd_config:
+PasswordAuthentication no
+
+.. and restart ssh service to enable changes: sudo service ssh restart
+.. we can verify that password authentication is disabled by running the following from @br: ssh -o PreferredAuthentication=password -o PubkeyAuthentication=no $HQ_IP
+
+# Firewall rules
+=================
+We disable ipv6 traffic on both @hq and @br by editing the /etc/sysctl.conf by adding the following lines:
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+
+.. and applying the changes with: sudo sysctl -p
+
+## Stateful filters
+We can use the prepared script template from lab exercises.
+To it we add the following rules:
+```
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# SSH traffic
+iptables -A OUTPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -m state --state NEW -j ACCEPT
+
+# ICMP
+# outgoing
+iptables -A OUTPUT -p icmp -m state --state NEW -j ACCEPT
+# incoming
+iptables -A INPUT -p icmp -m state --state NEW -j ACCEPT
+
+# VPN
+# - ISAKMP
+iptables -A INPUT -p udp --dport 500 -m state --state NEW -j ACCEPT
+iptables -A OUTPUT -p udp --dport 500 -m state --state NEW -j ACCEPT
+
+# - NAT-T
+iptables -A INPUT -p udp --dport 4500 -m state --state NEW -j ACCEPT
+iptables -A OUTPUT -p udp --dport 4500 -m state --state NEW -j ACCEPT
+
+# - IPSec
+iptables -A INPUT -p esp -m state --state NEW -j ACCEPT
+iptables -A INPUT -p ah -m state --state NEW -j ACCEPT
+iptables -A OUTPUT -p esp -m state --state NEW -j ACCEPT
+iptables -A OUTPUT -p ah -m state --state NEW -j ACCEPT
+```
+
+.. apply the filter by running: sudo ./iptables2.sh start
+.. for good measure we can stop and start the ipsec service in the foreground:
+```
+sudo ipsec stop
+sudo ipsec start --no-fork
+```
+and reestablish the vpn connection: sudo ipsec up net-net
+
+Now we can test that the firewall filter is working:
+1.)@hq$> ping $BR_IP # test for icmp
+2.)@hq$> ping -I 10.1.0.1 10.2.0.1 # test for icmp and vpn
+3.)@br$> ssh isp@$HQ_IP # test for ssh
+4.)@hq$> curl google.com # failed test for http/https
+
